@@ -1,147 +1,145 @@
-#### DATA LOADING & MERGE
+"""
+Australian Road Death Analysis
+"""
+import os, warnings
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import StandardScaler
+from scipy import stats
+from scipy.stats import skew, chi2_contingency
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
 from sklearn.decomposition import PCA
-import statsmodels.api as sm
+from sklearn.metrics import accuracy_score, roc_auc_score, classification_report, mean_squared_error, r2_score
 
-fatalities = pd.read_csv('fatalities.csv', low_memory=False)
-crashes = pd.read_csv('crashes.csv', low_memory=False)
+warnings.filterwarnings("ignore")
 
-df = pd.merge(fatalities, crashes, on='Crash ID', how='left')
-print("Merged shape:", df.shape)
+OUT = "plots"
+os.makedirs(OUT, exist_ok=True)
 
-############### CLEANING #############
-df.replace(-9, np.nan, inplace=True)
+C = {"bl":"#378ADD","te":"#1D9E75","co":"#D85A30","pu":"#7F77DD",
+"am":"#BA7517","gr":"#888780","re":"#A32D2D"}
 
-# === CRITICAL FIX: Clean Speed Limit after merge ===
-print("Cleaning Speed Limit column...")
-df['Speed Limit_x'] = df['Speed Limit_x'].replace('<40', 35)          # reasonable value
-df['Speed Limit_x'] = df['Speed Limit_x'].replace('Unspecified', np.nan)
-df['Speed Limit_x'] = pd.to_numeric(df['Speed Limit_x'], errors='coerce')
+def sav(n):
+    plt.tight_layout()
+    plt.savefig(f"{OUT}/{n}", dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f" [saved] {OUT}/{n}")
 
-df['Speed Limit_y'] = df['Speed Limit_y'].replace('<40', 35)
-df['Speed Limit_y'] = df['Speed Limit_y'].replace('Unspecified', np.nan)
-df['Speed Limit_y'] = pd.to_numeric(df['Speed Limit_y'], errors='coerce')
+def hr(t):
+    print(f"\n{'='*70}\n {t}\n{'='*70}")
 
-####check skewness ##########
-# Select only numeric columns
-numeric_data = df.select_dtypes(include=['number'])
+def ols_pv(X, y):
+    Xm = np.column_stack([np.ones(len(y)), X.values.astype(float)])
+    n, p = Xm.shape
+    b = np.linalg.lstsq(Xm, y.astype(float), rcond=None)[0]
+    r = y.astype(float) - Xm @ b
+    s2 = (r @ r) / max(n-p, 1)
+    se = np.sqrt(np.maximum(np.diag(np.linalg.pinv(Xm.T @ Xm)) * s2, 0))
+    pv = 2*(1 - stats.t.cdf(np.abs(b / np.where(se<1e-12,1e-12,se)), df=max(n-p,1)))
+    return pd.Series(pv[1:], index=X.columns)
 
-# Compute skewness for each numeric column
-skewness = numeric_data.skew()
+# ── 1. LOAD & MERGE ───────────────────────────────────────────────────────────
+hr("STEP 1 – LOAD & MERGE")
+crashes = pd.read_csv("crashes.csv", encoding="utf-8-sig", low_memory=False)
+fat = pd.read_csv("fatalities.csv", encoding="utf-8-sig", low_memory=False)
+crashes.columns = crashes.columns.str.strip()
+fat.columns = fat.columns.str.strip()
+crashes.rename(columns={"Bus \nInvolvement": "Bus Involvement"}, inplace=True, errors='ignore')
+df = crashes.merge(fat[["Crash ID", "Road User", "Gender", "Age", "Age Group"]],
+                   on="Crash ID", how="left")
+print(f"crashes: {crashes.shape} | fatalities: {fat.shape} | merged: {df.shape}")
 
-print("=== SKEWNESS ANALYSIS FOR NUMERIC COLUMNS ===\n")
+# ── 2. SKEWNESS & CENTRAL TENDENCY ───────────────────────────────────────────
+hr("STEP 2 – SKEWNESS & CENTRAL TENDENCY")
+print(f" {'Column':<23} {'Skew':>8} {'Mean':>8} {'Median':>8} {'Mode':>8} Recommendation")
+print("-" * 85)
+skew_info = {}
+for col in ["Number Fatalities", "Speed Limit", "Age"]:
+    if col not in df.columns: continue
+    s = df[col].dropna()
+    if len(s) == 0: continue
+    sk = float(skew(s))
+    rec = "USE MEAN" if abs(sk) < 0.5 else ("USE MEDIAN (right-skewed)" if sk > 0 else "USE MEDIAN (left-skewed)")
+    mode_val = float(s.mode().iloc[0]) if not s.mode().empty else np.nan
+    print(f" {col:<23} {sk:>8.3f} {s.mean():>8.2f} {s.median():>8.2f} {mode_val:>8.2f} {rec}")
 
-# Loop through each numeric column and create histogram + skewness value
-for col in numeric_data.columns:
-    skew_val = skewness[col]
-    
-    print(f"{col:25} → Skewness: {skew_val:6.3f} ", end="")
-    
-    # if skew_val > 0.5:
-    #     print("→ Strongly Right-Skewed → Recommend MEDIAN imputation")
-    # elif skew_val < -0.5:
-    #     print("→ Strongly Left-Skewed → Recommend MEDIAN imputation")
-    # else:
-    #     print("→ Roughly Symmetric → Mean is acceptable")
-    
-    # Plot histogram
-    plt.figure(figsize=(8, 5))
-    numeric_data[col].hist(bins=30, color='skyblue', edgecolor='black')
-    plt.title(f"Distribution of {col}\nSkewness = {skew_val:.3f}", fontsize=14)
-    plt.xlabel(col)
-    plt.ylabel("Frequency")
-    
-    # Add vertical lines for Mean and Median
-    mean_val = numeric_data[col].mean()
-    median_val = numeric_data[col].median()
-    
-    plt.axvline(mean_val, color='red', linestyle='dashed', linewidth=2, label=f'Mean = {mean_val:.2f}')
-    plt.axvline(median_val, color='green', linestyle='solid', linewidth=2, label=f'Median = {median_val:.2f}')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+cols_to_plot = ["Number Fatalities", "Speed Limit", "Age"]
+colors = [C["bl"], C["te"], C["co"]]
+for ax, col, col_c in zip(axes, cols_to_plot, colors):
+    if col not in df.columns:
+        ax.set_visible(False)
+        continue
+    d = df[col].dropna()
+    ax.hist(d, bins=35, color=col_c, edgecolor="white", alpha=0.85)
+    ax.axvline(d.mean(), color="red", ls="--", lw=1.8, label=f"Mean {d.mean():.1f}")
+    ax.axvline(d.median(), color="green", ls="--", lw=1.8, label=f"Median {d.median():.1f}")
+    ax.set_title(f"{col}\nskew={skew(d):+.2f}", fontsize=9)
+    ax.legend(fontsize=7)
+plt.suptitle("Step 2 – Skewness & Central Tendency", fontsize=11, fontweight="bold")
+sav("01_skewness.png")
 
-# Median imputation
-num_cols = ['Age', 'Speed Limit_x', 'Speed Limit_y', 'Number Fatalities']
-for col in num_cols:
+# ── 3. DATA CLEANING ─────────────────────────────────────────────────────────
+hr("STEP 3 – DATA CLEANING")
+df = df.drop(columns=["_id"], errors="ignore")
+df = df.replace([-9, "-9"], np.nan)
+numeric_cols = ["Speed Limit", "Age"]
+for col in numeric_cols:
     if col in df.columns:
-        df[col] = df[col].fillna(df[col].median())
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Mode imputation for categorical
-cat_cols = ['State_x', 'State_y', 'Crash Type_x', 'Crash Type_y', 'Road User',
-            'National Remoteness Areas_x', 'National Remoteness Areas_y',
-            'Dayweek', 'Time of day', 'Christmas Period', 'Easter Period']
+binary_cols = ["Bus Involvement", "Heavy Rigid Truck Involvement",
+               "Articulated Truck Involvement", "Christmas Period", "Easter Period"]
+for c in binary_cols:
+    if c in df.columns:
+        df[c] = df[c].map({"Yes": 1, "No": 0, 1:1, 0:0})
 
-for col in cat_cols:
-    if col in df.columns:
-        df[col] = df[col].fillna(df[col].mode()[0])
+df = df.dropna(subset=["Number Fatalities"]).reset_index(drop=True)
 
-print(f"Shape after cleaning: {df.shape}")
-print(f"Missing values left: {df.isnull().sum().sum()}\n")
+num_cols = df.select_dtypes(include=np.number).columns
+for c in num_cols:
+    df[c] = df[c].fillna(df[c].median())
 
-############ 3. FEATURE ENGINEERING + STANDARDISATION ##############
-cat_features = [col for col in ['State_x', 'State_y', 'Crash Type_x', 'Crash Type_y',
-                                'Road User', 'National Remoteness Areas_x',
-                                'National Remoteness Areas_y', 'Dayweek',
-                                'Time of day', 'Christmas Period', 'Easter Period']
-                if col in df.columns]
+df = df.fillna({
+    "Road User": "Unknown",
+    "Gender": "Unknown",
+    "Age Group": "Unknown",
+    "National Remoteness Areas": "Unknown",
+    "National Road Type": "Unknown",
+    "Crash Type": "Single"
+})
 
-X_cat = pd.get_dummies(df[cat_features], drop_first=True)
+pre = len(df)
+df = df.drop_duplicates().reset_index(drop=True)
+print(f"Duplicates removed: {pre - len(df)} | Final shape: {df.shape}")
 
-num_features = ['Speed Limit_x', 'Speed Limit_y', 'Year', 'Month']
-X_num = df[[col for col in num_features if col in df.columns]]
 
-X = pd.concat([X_cat, X_num], axis=1)
 
-y_age = df['Age']
+# ── 4. FEATURE ENGINEERING ───────────────────────────────────────────────────
+hr("STEP 4 – FEATURE ENGINEERING")
+if "Time" in df.columns:
+    df["Hour"] = pd.to_datetime(df["Time"], errors="coerce").dt.hour
+else:
+    df["Hour"] = 12
+df["Hour"] = df["Hour"].fillna(12)
+df["Is_Night"] = df["Hour"].isin(range(0, 6)).astype(int)
 
-# Standardisation
-scaler = StandardScaler()
-X_std = scaler.fit_transform(X)
-X_std = pd.DataFrame(X_std, columns=X.columns)
+if "Dayweek" in df.columns:
+    df["Is_Weekend"] = df["Dayweek"].astype(str).str.contains("Sat|Sun|weekend", case=False, na=False).astype(int)
+elif "Day of week" in df.columns:
+    df["Is_Weekend"] = df["Day of week"].astype(str).str.contains("Sat|Sun|weekend", case=False, na=False).astype(int)
+else:
+    df["Is_Weekend"] = 0
 
-print(f"Final feature matrix shape: {X_std.shape}")
-print("Standardisation completed successfully!")
-
-# FEATURE SELECTION (Backward Elimination)
-print("Feature Selection using Backward Elimination...")
-
-X_const = sm.add_constant(X_std)
-
-def backward_elimination(X, y, threshold=0.05):
-    cols = list(X.columns)
-    while len(cols) > 0:
-        model = sm.OLS(y, X[cols]).fit()
-        pvals = model.pvalues[1:]
-        max_p = pvals.max()
-        if max_p > threshold:
-            remove = pvals.idxmax()
-            cols.remove(remove)
-        else:
-            break
-    return cols
-
-selected_features = backward_elimination(X_const, y_age)
-print("Selected features:", selected_features, "\n")
-
-#############  PCA VISUALISATION
-
-print("PCA Visualisation (PC1 vs PC2)...")
-
-pca = PCA(n_components=2)
-X_pca = pca.fit_transform(X_std)
-
-plt.figure(figsize=(10, 7))
-plt.scatter(X_pca[:, 0], X_pca[:, 1], c=y_age, cmap='viridis', alpha=0.7)
-plt.colorbar(label='Age of Deceased')
-plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
-plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
-plt.title('PCA: PC1 vs PC2 coloured by Age')
-plt.savefig('pca_plot.png', dpi=300, bbox_inches='tight')
-plt.show()
-
-print(f"PC1 + PC2 explained variance: {pca.explained_variance_ratio_.sum():.1%}\n")
+df["Is_Holiday"] = df[["Christmas Period", "Easter Period"]].max(axis=1).astype(int)
+df["Is_HighSpeed"] = (df["Speed Limit"] >= 100).astype(int)
+df["Is_VRU"] = df["Road User"].isin(["Pedestrian", "Pedal cyclist", "Motorcycle rider"]).astype(int)
+df["Is_Single_Crash"] = (df["Crash Type"].astype(str).str.lower().str.contains("single")).astype(int)
+df["Age_Speed"] = df["Age"] * df["Speed Limit"]
+df["Night_Speed"] = df["Is_Night"] * df["Speed Limit"]
