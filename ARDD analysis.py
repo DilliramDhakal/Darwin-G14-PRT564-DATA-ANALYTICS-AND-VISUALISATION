@@ -296,3 +296,128 @@ pred = model.predict(X_test)
 print("Accuracy :", accuracy_score(y_test, pred))
 print("AUC :", roc_auc_score(y_test, model.predict_proba(X_test)[:, 1]))
 print(classification_report(y_test, pred))
+
+# ── RQ3 – REGRESSION: Per-Crash + Monthly Aggregated ───────────────────────────
+hr("RQ3 – Regression: Per-Crash vs Monthly Aggregated")
+
+# ====================== 1. NORMAL (PER-CRASH) REGRESSION ======================
+print("\n=== 1. NORMAL (Per-Crash) Regression ===")
+X_normal = df[features].fillna(0)
+y_normal = df["Number Fatalities"]
+
+# Backward Elimination for Linear Regression
+print("Performing Backward Elimination for Linear Regression...")
+remaining = list(X_normal.columns)
+for it in range(len(remaining)):
+    pv = ols_pv(X_normal[remaining], y_normal)
+    if pv.max() > 0.05:
+        drop = pv.idxmax()
+        print(f" Iter {it+1}: removed '{drop}' (p={pv.max():.4f})")
+        remaining.remove(drop)
+    else:
+        break
+
+print(f"Final features kept for Linear Regression: {remaining}\n")
+
+X_train_n, X_test_n, y_train_n, y_test_n = train_test_split(
+    X_normal[remaining], y_normal, test_size=0.25, random_state=42
+)
+
+# Linear Regression (Per-Crash)
+lr_n = LinearRegression()
+lr_n.fit(X_train_n, y_train_n)
+y_pred_lr_n = lr_n.predict(X_test_n)
+print(f"Per-Crash Linear Regression : R² = {r2_score(y_test_n, y_pred_lr_n):.4f} | "
+      f"RMSE = {np.sqrt(mean_squared_error(y_test_n, y_pred_lr_n)):.4f}")
+
+# Random Forest (Per-Crash) - This is what you want for feature importance
+rf_n = RandomForestRegressor(n_estimators=400, max_depth=15, random_state=42, n_jobs=-1)
+rf_n.fit(X_train_n, y_train_n)
+y_pred_rf_n = rf_n.predict(X_test_n)
+print(f"Per-Crash Random Forest     : R² = {r2_score(y_test_n, y_pred_rf_n):.4f} | "
+      f"RMSE = {np.sqrt(mean_squared_error(y_test_n, y_pred_rf_n)):.4f}")
+
+# === FEATURE IMPORTANCE FOR PER-CRASH LEVEL (Most Important Part) ===
+print("\n=== Feature Importance for Predicting Fatalities per Crash (Random Forest) ===")
+crash_importance = pd.Series(rf_n.feature_importances_, index=remaining).sort_values(ascending=False)
+print(crash_importance.round(4))
+
+# ====================== MONTHLY AGGREGATION ======================
+print("\n=== MONTHLY AGGREGATION ===")
+agg_month = df.groupby(["Year", "Month"]).agg(
+    Total_Fatalities=("Number Fatalities", "sum"),
+    Num_Crashes=("Number Fatalities", "count"),
+    Avg_Speed=("Speed Limit", "mean"),
+    Avg_Age=("Age", "mean"),
+    Pct_Night=("Is_Night", "mean"),
+    Pct_Weekend=("Is_Weekend", "mean"),
+    Pct_HighSpeed=("Is_HighSpeed", "mean"),
+    Pct_VRU=("Is_VRU", "mean"),
+    Pct_Single=("Is_Single_Crash", "mean"),
+    Pct_Holiday=("Is_Holiday", "mean")
+).reset_index()
+
+agg_month["Date"] = pd.to_datetime(agg_month[["Year", "Month"]].assign(day=1))
+agg_month = agg_month.sort_values("Date").reset_index(drop=True)
+agg_month["Month_Num"] = (agg_month["Year"] - agg_month["Year"].min()) * 12 + agg_month["Month"]
+
+features_month = ["Month_Num", "Num_Crashes", "Avg_Speed", "Avg_Age", 
+                  "Pct_Night", "Pct_Weekend", "Pct_HighSpeed", 
+                  "Pct_VRU", "Pct_Single", "Pct_Holiday"]
+
+X_month = agg_month[features_month]
+y_month = agg_month["Total_Fatalities"]
+
+X_train_m, X_test_m, y_train_m, y_test_m = train_test_split(X_month, y_month, test_size=0.25, random_state=42)
+
+lr_m = LinearRegression().fit(X_train_m, y_train_m)
+rf_m = RandomForestRegressor(n_estimators=600, max_depth=15, random_state=42, n_jobs=-1).fit(X_train_m, y_train_m)
+
+y_pred_rf_m = rf_m.predict(X_month)
+
+print(f"Monthly Random Forest → R² = {r2_score(y_month, y_pred_rf_m):.4f} | "
+      f"RMSE = {np.sqrt(mean_squared_error(y_month, y_pred_rf_m)):.1f}")
+
+
+
+#====================== VISUALIZATIONS ======================
+#Per-Crash Feature Importance Plot (This is what you asked for)
+plt.figure(figsize=(10, 7))
+crash_importance.plot(kind='barh', color=C["te"], edgecolor='black')
+plt.title("RQ3 – Feature Importance for Predicting Fatalities per Crash (Random Forest)")
+plt.xlabel("Importance Score")
+plt.tight_layout()
+sav("12_RQ3_PerCrash_Feature_Importance.png")
+
+
+
+agg_month["Date"] = pd.to_datetime(agg_month["Date"])
+
+# Filter data after 2010
+mask = agg_month["Date"] >= "2014-01-01"
+
+agg_filtered = agg_month[mask]
+y_pred_filtered = y_pred_rf_m[mask]
+
+# Plot
+plt.figure(figsize=(16, 7))
+
+plt.plot(agg_filtered["Date"], agg_filtered["Total_Fatalities"],
+         marker='.', lw=1.8, color=C["bl"], label="Actual Monthly Fatalities")
+
+plt.plot(agg_filtered["Date"], y_pred_filtered,
+         marker='.', lw=1.8, color=C["te"], label="Random Forest Predicted")
+
+plt.xlabel("Year-Month", fontsize=12)
+plt.ylabel("Total Road Fatalities", fontsize=12)
+plt.title("RQ3 – Monthly Actual vs Predicted Road Fatalities (After 2010)",
+          fontsize=14, fontweight="bold")
+
+plt.legend(fontsize=11)
+plt.grid(True, alpha=0.3)
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+sav("11_RQ3_Monthly_Trend.png")
+
+print("\nRQ3 Completed - Per-Crash Feature Importance Added!")
